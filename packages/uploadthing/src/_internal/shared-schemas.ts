@@ -9,7 +9,7 @@ export const ACLSchema = S.Literal(...ValidACLs);
 /**
  * Valid options for the `?actionType` query param
  */
-export const ActionType = S.Literal("upload");
+export const ActionType = S.Literal("upload", "complete");
 
 /**
  * Valid options for the `uploadthing-hook` header
@@ -146,4 +146,18 @@ export class UploadActionPayload extends S.Class<UploadActionPayload>(
 )({
   files: S.Array(FileUploadData),
   input: S.Unknown as S.Schema<Json>,
+}) {}
+
+/**
+ * Sent by client when using custom S3 backend to signal upload completion
+ * and trigger onUploadComplete callback
+ */
+export class CompleteActionPayload extends S.Class<CompleteActionPayload>(
+  "CompleteActionPayload",
+)({
+  fileKey: S.String,
+  fileName: S.String,
+  fileSize: S.Number,
+  fileType: S.String,
+  customId: S.NullOr(S.String),
 }) {}

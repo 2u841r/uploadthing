@@ -11,6 +11,7 @@ import * as Config from "effect/Config";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Match from "effect/Match";
+import * as Option from "effect/Option";
 import * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
 
@@ -27,7 +28,8 @@ import {
 
 import * as pkgJson from "../../package.json";
 import type { FileRouter, RouteHandlerOptions } from "../types";
-import { IngestUrl, IsDevelopment, UTToken } from "./config";
+import { IngestUrl, IsDevelopment, S3AccessKey, S3Bucket, S3Endpoint, S3PublicUrl, S3Region, S3SecretKey, UTToken } from "./config";
+import { generateS3PresignedUrl } from "./s3-presigned-url";
 import { logDeprecationWarning } from "./deprecations";
 import { formatError } from "./error-formatter";
 import { handleJsonLineStream } from "./jsonl";
@@ -38,6 +40,7 @@ import { makeRuntime } from "./runtime";
 import {
   ActionType,
   CallbackResultResponse,
+  CompleteActionPayload,
   MetadataFetchResponse,
   MetadataFetchStreamPart,
   UploadActionPayload,
@@ -178,6 +181,13 @@ export const createRequestHandler = <TRouter extends FileRouter>(
             slug,
           }),
         ),
+        Match.when({ actionType: "complete", uploadthingHook: undefined }, () =>
+          handleCompleteAction({
+            uploadable,
+            fePackage,
+            beAdapter,
+          }),
+        ),
         Match.when({ actionType: undefined, uploadthingHook: "callback" }, () =>
           handleCallbackRequest({ uploadable, fePackage, beAdapter }),
         ),
@@ -237,6 +247,101 @@ export const createRequestHandler = <TRouter extends FileRouter>(
       HttpRouter.use(appendResponseHeaders),
     );
   }).pipe(Effect.withLogSpan("createRequestHandler"));
+
+const handleCompleteAction = (opts: {
+  uploadable: AnyFileRoute;
+  fePackage: string;
+  beAdapter: string;
+}) =>
+  Effect.gen(function* () {
+    const { uploadable, fePackage, beAdapter } = opts;
+    const json = yield* HttpServerRequest.schemaBodyJson(CompleteActionPayload);
+    const s3PublicUrl = yield* S3PublicUrl;
+
+    // Construct the public URL if S3PublicUrl is configured
+    const fileUrl = Option.isSome(s3PublicUrl)
+      ? `${Option.getOrThrow(s3PublicUrl)}/${json.fileKey}`
+      : null;
+
+    yield* Effect.logDebug("Handling complete action with input:").pipe(
+      Effect.annotateLogs("json", json),
+    );
+
+    /**
+     * Run `.onUploadComplete` as a daemon to prevent the
+     * request from potentially timing out.
+     */
+    const fiber = yield* Effect.gen(function* () {
+      const adapterArgs = yield* AdapterArguments;
+
+      // Build a file object similar to what the callback receives
+      const file = {
+        key: json.fileKey,
+        name: json.fileName,
+        size: json.fileSize,
+        type: json.fileType,
+        customId: json.customId ?? undefined,
+        // S3 uploads now have the public URL if configured
+        url: fileUrl as never,
+        appUrl: fileUrl as never,
+        ufsUrl: fileUrl as never,
+        fileHash: null as never,
+      };
+
+      const serverData = yield* Effect.tryPromise({
+        try: async () =>
+          uploadable.onUploadComplete({
+            ...adapterArgs,
+            file,
+            metadata: {},
+          }) as Promise<unknown>,
+        catch: (error) =>
+          new UploadThingError({
+            code: "INTERNAL_SERVER_ERROR",
+            message:
+              "Failed to run onUploadComplete. You probably shouldn't be throwing errors here.",
+            cause: error,
+          }),
+      });
+
+      const payload = {
+        fileKey: json.fileKey,
+        callbackData: serverData ?? null,
+        file: {
+          key: file.key,
+          name: file.name,
+          size: file.size,
+          type: file.type,
+          customId: file.customId,
+          url: fileUrl,
+          appUrl: fileUrl,
+          ufsUrl: fileUrl,
+          fileHash: file.fileHash,
+        },
+      };
+      yield* Effect.logDebug(
+        "'onUploadComplete' callback finished for S3 upload:",
+      ).pipe(Effect.annotateLogs("callbackData", payload));
+    }).pipe(Effect.ignoreLogged, Effect.forkDaemon);
+
+    return {
+      body: {
+        ok: true,
+        file: {
+          key: json.fileKey,
+          name: json.fileName,
+          size: json.fileSize,
+          type: json.fileType,
+          customId: json.customId,
+          url: fileUrl,
+          appUrl: fileUrl,
+          ufsUrl: fileUrl,
+          fileHash: null,
+        },
+      },
+      fiber,
+    };
+  }).pipe(Effect.withLogSpan("handleCompleteAction"));
 
 const handleErrorRequest = (opts: { uploadable: AnyFileRoute }) =>
   Effect.gen(function* () {
@@ -565,13 +670,36 @@ const handleUploadAction = (opts: {
     );
 
     const routeOptions = uploadable.routeOptions;
-    const { apiKey, appId } = yield* UTToken;
-    const ingestUrl = yield* IngestUrl(preferredRegion);
+    const s3Endpoint = yield* S3Endpoint;
+    const s3Bucket = yield* S3Bucket;
+    const s3AccessKey = yield* S3AccessKey;
+    const s3SecretKey = yield* S3SecretKey;
+    const s3Region = yield* S3Region;
+
+    const isS3Configured =
+      Option.isSome(s3Endpoint) &&
+      Option.isSome(s3Bucket) &&
+      Option.isSome(s3AccessKey) &&
+      Option.isSome(s3SecretKey);
+
+    // Only require UPLOADTHING_TOKEN if not using custom S3
+    const tokenOrFallback = yield* (isS3Configured
+      ? Effect.succeed({
+          apiKey: Redacted.make(""),
+          appId: "s3-custom-backend",
+        })
+      : UTToken);
+
+    const { apiKey, appId } = tokenOrFallback;
+    const ingestUrl = yield* (isS3Configured
+      ? Effect.succeed("")
+      : IngestUrl(preferredRegion));
     const isDev = yield* IsDevelopment;
 
     yield* Effect.logDebug("Generating presigned URLs").pipe(
       Effect.annotateLogs("fileUploadRequests", fileUploadRequests),
       Effect.annotateLogs("ingestUrl", ingestUrl),
+      Effect.annotateLogs("isS3Configured", isS3Configured),
     );
     const presignedUrls = yield* Effect.forEach(
       fileUploadRequests,
@@ -584,19 +712,30 @@ const handleUploadAction = (opts: {
             routeOptions.hashFn,
           );
 
-          const url = yield* generateSignedURL(`${ingestUrl}/${key}`, apiKey, {
-            ttlInSeconds: routeOptions.presignedURLTTL,
-            data: {
-              "x-ut-identifier": appId,
-              "x-ut-file-name": file.name,
-              "x-ut-file-size": file.size,
-              "x-ut-file-type": file.type,
-              "x-ut-slug": slug,
-              "x-ut-custom-id": file.customId,
-              "x-ut-content-disposition": file.contentDisposition,
-              "x-ut-acl": file.acl,
-            },
-          });
+          const url = yield* (isS3Configured
+            ? generateS3PresignedUrl({
+                endpoint: Option.getOrThrow(s3Endpoint),
+                bucket: Option.getOrThrow(s3Bucket),
+                accessKey: Option.getOrThrow(s3AccessKey),
+                secretKey: Option.getOrThrow(s3SecretKey),
+                region: s3Region,
+                key,
+                ttl: routeOptions.presignedURLTTL,
+              }).pipe(Effect.scoped)
+            : generateSignedURL(`${ingestUrl}/${key}`, apiKey, {
+                ttlInSeconds: routeOptions.presignedURLTTL,
+                data: {
+                  "x-ut-identifier": appId,
+                  "x-ut-file-name": file.name,
+                  "x-ut-file-size": file.size,
+                  "x-ut-file-type": file.type,
+                  "x-ut-slug": slug,
+                  "x-ut-custom-id": file.customId,
+                  "x-ut-content-disposition": file.contentDisposition,
+                  "x-ut-acl": file.acl,
+                },
+              }));
+
           return { url, key };
         }),
       { concurrency: "unbounded" },
@@ -672,53 +811,55 @@ const handleUploadAction = (opts: {
     // Send metadata to UT server (non blocking as a daemon)
     // In dev, keep the stream open and simulate the callback requests as
     // files complete uploading
-    const fiber = yield* Effect.if(isDev, {
-      onTrue: () =>
-        metadataRequest.pipe(
-          Effect.tapBoth({
-            onSuccess: logHttpClientResponse("Registered metadata", {
-              mixin: "None", // We're reading the stream so can't call a body mixin
-            }),
-            onFailure: logHttpClientError("Failed to register metadata"),
-          }),
-          HttpClientResponse.stream,
-          handleJsonLineStream(MetadataFetchStreamPart, (chunk) =>
-            devHookRequest.pipe(
-              HttpClientRequest.setHeaders({
-                "uploadthing-hook": chunk.hook,
-                "x-uploadthing-signature": chunk.signature,
+    // Skip metadata request when using custom S3 backend
+    const metadataEffect = isS3Configured
+      ? Effect.logInfo(
+          "Using custom S3 backend - skipping UploadThing metadata registration",
+        ).pipe(Effect.ignoreLogged)
+      : isDev
+        ? metadataRequest.pipe(
+            Effect.tapBoth({
+              onSuccess: logHttpClientResponse("Registered metadata", {
+                mixin: "None", // We're reading the stream so can't call a body mixin
               }),
-              HttpClientRequest.setBody(
-                HttpBody.text(chunk.payload, "application/json"),
-              ),
-              httpClient.execute,
-              Effect.tap(
-                logHttpClientResponse(
-                  "Successfully forwarded callback request from dev stream",
+              onFailure: logHttpClientError("Failed to register metadata"),
+            }),
+            HttpClientResponse.stream,
+            handleJsonLineStream(MetadataFetchStreamPart, (chunk) =>
+              devHookRequest.pipe(
+                HttpClientRequest.setHeaders({
+                  "uploadthing-hook": chunk.hook,
+                  "x-uploadthing-signature": chunk.signature,
+                }),
+                HttpClientRequest.setBody(
+                  HttpBody.text(chunk.payload, "application/json"),
                 ),
+                httpClient.execute,
+                Effect.tap(
+                  logHttpClientResponse(
+                    "Successfully forwarded callback request from dev stream",
+                  ),
+                ),
+                Effect.catchTag("ResponseError", (err: any) =>
+                  handleDevStreamError(err, chunk.payload),
+                ),
+                Effect.annotateLogs(chunk),
+                Effect.asVoid,
+                Effect.ignoreLogged,
+                Effect.scoped,
               ),
-              Effect.catchTag("ResponseError", (err) =>
-                handleDevStreamError(err, chunk.payload),
-              ),
-              Effect.annotateLogs(chunk),
-              Effect.asVoid,
-              Effect.ignoreLogged,
-              Effect.scoped,
             ),
-          ),
-        ),
-      onFalse: () =>
-        metadataRequest.pipe(
-          Effect.tapBoth({
-            onSuccess: logHttpClientResponse("Registered metadata"),
-            onFailure: logHttpClientError("Failed to register metadata"),
-          }),
-          Effect.flatMap(
-            HttpClientResponse.schemaBodyJson(MetadataFetchResponse),
-          ),
-          Effect.scoped,
-        ),
-    }).pipe(Effect.forkDaemon);
+          )
+        : metadataRequest.pipe(
+            Effect.tapBoth({
+              onSuccess: logHttpClientResponse("Registered metadata"),
+              onFailure: logHttpClientError("Failed to register metadata"),
+            }),
+            Effect.flatMap(HttpClientResponse.schemaBodyJson(MetadataFetchResponse)),
+            Effect.scoped,
+          );
+
+    const fiber = yield* metadataEffect.pipe(Effect.forkDaemon);
 
     const presigneds = presignedUrls.map((p, i) => ({
       url: p.url,
