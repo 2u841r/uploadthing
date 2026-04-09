@@ -110,3 +110,13 @@ export const UfsAppIdLocation = Config.literal(
   "subdomain",
   "path",
 )("ufsAppIdLocation").pipe(Config.withDefault("subdomain"));
+
+// S3 Custom Backend Configuration
+export const S3Endpoint = Config.string("s3Endpoint").pipe(Config.option);
+export const S3Bucket = Config.string("s3Bucket").pipe(Config.option);
+export const S3AccessKey = Config.string("s3AccessKey").pipe(Config.option);
+export const S3SecretKey = Config.string("s3SecretKey").pipe(Config.option);
+export const S3Region = Config.string("s3Region").pipe(
+  Config.withDefault("us-east-1"),
+);
+export const S3PublicUrl = Config.string("s3PublicUrl").pipe(Config.option);
