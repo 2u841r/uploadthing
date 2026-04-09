@@ -182,11 +182,7 @@ export const createRequestHandler = <TRouter extends FileRouter>(
           }),
         ),
         Match.when({ actionType: "complete", uploadthingHook: undefined }, () =>
-          handleCompleteAction({
-            uploadable,
-            fePackage,
-            beAdapter,
-          }),
+          handleCompleteAction({ uploadable }),
         ),
         Match.when({ actionType: undefined, uploadthingHook: "callback" }, () =>
           handleCallbackRequest({ uploadable, fePackage, beAdapter }),
@@ -248,13 +244,9 @@ export const createRequestHandler = <TRouter extends FileRouter>(
     );
   }).pipe(Effect.withLogSpan("createRequestHandler"));
 
-const handleCompleteAction = (opts: {
-  uploadable: AnyFileRoute;
-  fePackage: string;
-  beAdapter: string;
-}) =>
+const handleCompleteAction = (opts: { uploadable: AnyFileRoute }) =>
   Effect.gen(function* () {
-    const { uploadable, fePackage, beAdapter } = opts;
+    const { uploadable } = opts;
     const json = yield* HttpServerRequest.schemaBodyJson(CompleteActionPayload);
     const s3PublicUrl = yield* S3PublicUrl;
 
@@ -282,10 +274,10 @@ const handleCompleteAction = (opts: {
         type: json.fileType,
         customId: json.customId ?? undefined,
         // S3 uploads now have the public URL if configured
-        url: fileUrl as never,
-        appUrl: fileUrl as never,
-        ufsUrl: fileUrl as never,
-        fileHash: null as never,
+        url: fileUrl ?? "",
+        appUrl: fileUrl ?? "",
+        ufsUrl: fileUrl ?? "",
+        fileHash: "",
       };
 
       const serverData = yield* Effect.tryPromise({
@@ -840,7 +832,7 @@ const handleUploadAction = (opts: {
                     "Successfully forwarded callback request from dev stream",
                   ),
                 ),
-                Effect.catchTag("ResponseError", (err: any) =>
+                Effect.catchTag("ResponseError", (err: HttpClientError.ResponseError) =>
                   handleDevStreamError(err, chunk.payload),
                 ),
                 Effect.annotateLogs(chunk),
